@@ -38,3 +38,4 @@ That's it. Vercel's free tier handles everything.
 3. The backend fetches YouTube's built-in caption data directly (no AI, no cost)
 4. Clean text is returned and displayed instantly
 # Youtube-Caption-Extractor
+# Youtube-Caption-Extractor

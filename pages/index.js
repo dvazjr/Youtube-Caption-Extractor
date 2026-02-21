@@ -46,10 +46,18 @@ export default function Home() {
         body: JSON.stringify({ videoId }),
       });
 
-      const data = await res.json();
+      let data;
+      try { data = await res.json(); }
+      catch { data = { error: `Server error (HTTP ${res.status}) — check Vercel function logs` }; }
 
       if (!res.ok) {
-        setErrMsg(data.error || `Error ${res.status}`);
+        setErrMsg(data?.error || `HTTP ${res.status} error`);
+        setStatus("error");
+        return;
+      }
+
+      if (!data?.transcript) {
+        setErrMsg("No transcript returned. The video may not have captions.");
         setStatus("error");
         return;
       }
@@ -60,7 +68,7 @@ export default function Home() {
       setTranscript(data.transcript);
       setStatus("done");
     } catch (err) {
-      setErrMsg("Network error — make sure you're connected and try again.");
+      setErrMsg("Network error: " + (err.message || "check your connection"));
       setStatus("error");
     }
   }

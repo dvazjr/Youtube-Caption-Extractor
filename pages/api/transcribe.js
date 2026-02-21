@@ -1,10 +1,11 @@
+import https from "https";
+
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
 
   const { videoId } = req.body;
-
   if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
     return res.status(400).json({ error: "Invalid video ID" });
   }
@@ -14,106 +15,59 @@ export default async function handler(req, res) {
     const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
     return res.status(200).json({ transcript, wordCount });
   } catch (err) {
-    console.error("Transcript error:", err.message);
+    console.error("[transcribe]", err.message);
     return res.status(500).json({ error: err.message });
   }
 }
 
-async function fetchXml(url) {
-  const res = await fetch(url, {
-    headers: {
-      "User-Agent":
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      "Accept-Language": "en-US,en;q=0.9",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    },
+// Promisified https.get
+function httpsGet(url, headers = {}) {
+  return new Promise((resolve, reject) => {
+    const opts = {
+      headers: {
+        "User-Agent":
+          "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+        "Accept-Language": "en-US,en;q=0.9",
+        ...headers,
+      },
+    };
+    https
+      .get(url, opts, (r) => {
+        const chunks = [];
+        r.on("data", (c) => chunks.push(c));
+        r.on("end", () =>
+          resolve({
+            status: r.statusCode,
+            body: Buffer.concat(chunks).toString(),
+          }),
+        );
+        r.on("error", reject);
+      })
+      .on("error", reject);
   });
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
-  return res.text();
-}
-
-function parseXmlToText(xml) {
-  const segments = [];
-  const regex = /<text[^>]*>([\s\S]*?)<\/text>/g;
-  let match;
-  while ((match = regex.exec(xml)) !== null) {
-    const text = match[1]
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/\n/g, " ")
-      .trim();
-    if (text && !["[Music]", "[Applause]", "[Laughter]"].includes(text)) {
-      segments.push(text);
-    }
-  }
-  // Deduplicate consecutive identical lines (auto-caption artifact)
-  return segments.filter((s, i) => s !== segments[i - 1]).join(" ");
 }
 
 async function getTranscript(videoId) {
-  // Try these caption URL variants in order
-  const variants = [
-    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=srv1`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en-US&fmt=srv1`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en-GB&fmt=srv1`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en&fmt=srv1`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en`,
-  ];
-
-  for (const url of variants) {
-    try {
-      const xml = await fetchXml(url);
-      if (xml && xml.includes("<text")) {
-        const text = parseXmlToText(xml);
-        if (text.length > 20) return text;
-      }
-    } catch (_) {
-      // try next variant
-    }
-  }
-
-  // Last resort: scrape the page to get the actual caption track URL
-  return await scrapeAndFetch(videoId);
-}
-
-async function scrapeAndFetch(videoId) {
-  // Fetch with cookie consent bypass
-  const pageRes = await fetch(
-    `https://www.youtube.com/watch?v=${videoId}&hl=en&gl=US`,
-    {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-        Accept:
-          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        Cookie: "CONSENT=YES+cb; YSC=1; VISITOR_INFO1_LIVE=1",
-      },
-    },
+  // Use the iOS YouTube client — much harder for YouTube to block than browser UA
+  // Fetch video page
+  const { status, body: html } = await httpsGet(
+    `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`,
+    { Cookie: "SOCS=CAI; GPS=1" },
   );
 
-  if (!pageRes.ok) throw new Error(`YouTube page returned ${pageRes.status}`);
-  const html = await pageRes.text();
+  if (status !== 200) throw new Error(`YouTube returned HTTP ${status}`);
 
-  // Find ytInitialPlayerResponse
+  // Extract ytInitialPlayerResponse
   const marker = "ytInitialPlayerResponse = ";
-  const start = html.indexOf(marker);
-  if (start === -1) {
-    throw new Error(
-      "Could not parse YouTube page. The video may be unavailable in this region.",
-    );
-  }
+  const si = html.indexOf(marker);
+  if (si === -1) throw new Error("Could not find player response in page");
 
-  const jsonStart = start + marker.length;
+  const js = html.slice(si + marker.length);
   let depth = 0,
-    end = jsonStart;
-  for (let i = jsonStart; i < html.length; i++) {
-    if (html[i] === "{") depth++;
-    else if (html[i] === "}") {
+    end = 0;
+  for (let i = 0; i < js.length; i++) {
+    if (js[i] === "{") depth++;
+    else if (js[i] === "}") {
       depth--;
       if (depth === 0) {
         end = i + 1;
@@ -122,33 +76,71 @@ async function scrapeAndFetch(videoId) {
     }
   }
 
-  let playerData;
+  let player;
   try {
-    playerData = JSON.parse(html.slice(jsonStart, end));
+    player = JSON.parse(js.slice(0, end));
   } catch {
-    throw new Error("Could not parse YouTube player data");
+    throw new Error("Failed to parse player response");
   }
 
+  // Get caption tracks
   const tracks =
-    playerData?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-
-  if (!tracks || tracks.length === 0) {
+    player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!tracks?.length) {
+    // Try to give a useful reason
+    const status = player?.playabilityStatus;
+    if (status?.status === "LOGIN_REQUIRED")
+      throw new Error("This video is age-restricted or private.");
+    if (status?.status === "ERROR")
+      throw new Error("Video not found or unavailable.");
     throw new Error(
-      "No captions found. The video may not have captions enabled.",
+      "No captions found. Make sure the video has CC enabled on YouTube.",
     );
   }
 
+  // Pick English track
   const track =
+    tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
     tracks.find((t) => t.languageCode === "en") ||
     tracks.find((t) => t.languageCode?.startsWith("en")) ||
     tracks[0];
 
-  if (!track?.baseUrl) throw new Error("Caption URL not found in player data");
+  console.log(
+    "[transcribe] track:",
+    track.languageCode,
+    track.kind ?? "manual",
+    track.name?.simpleText,
+  );
 
-  const xml = await fetchXml(track.baseUrl);
-  if (!xml || !xml.includes("<text")) throw new Error("Caption data was empty");
+  // Fetch caption XML
+  const capUrl = track.baseUrl + "&fmt=srv1";
+  const { status: capStatus, body: xml } = await httpsGet(capUrl);
+  if (capStatus !== 200)
+    throw new Error(`Caption fetch returned HTTP ${capStatus}`);
+  if (!xml.includes("<text")) throw new Error("Caption XML was empty");
 
-  const text = parseXmlToText(xml);
-  if (!text) throw new Error("Could not extract text from captions");
-  return text;
+  // Parse XML
+  const re = /<text[^>]*>([\s\S]*?)<\/text>/g;
+  const segs = [];
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const t = m[1]
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\n/g, " ")
+      .trim();
+    if (
+      t &&
+      !["[Music]", "[Applause]", "[Laughter]", "♪", "[music]"].includes(t)
+    ) {
+      segs.push(t);
+    }
+  }
+
+  if (!segs.length) throw new Error("Transcript was empty after parsing");
+
+  return segs.filter((s, i) => s !== segs[i - 1]).join(" ");
 }

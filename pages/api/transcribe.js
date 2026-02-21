@@ -19,110 +19,75 @@ export default async function handler(req, res) {
 }
 
 async function getTranscript(videoId) {
-  // Try multiple InnerTube client contexts — different clients have different access
-  const clients = [
-    {
-      name: "ANDROID",
-      clientName: "ANDROID",
-      clientVersion: "18.11.34",
-      androidSdkVersion: 30,
-      userAgent: "com.google.android.youtube/18.11.34 (Linux; U; Android 11) gzip",
-      apiKey: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
-      xClientName: "3",
+  // TVHTML5_SIMPLY_EMBEDDED_PLAYER with thirdParty.embedUrl bypasses
+  // LOGIN_REQUIRED on public videos — embedded players skip auth checks
+  const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "X-YouTube-Client-Name": "85",
+      "X-YouTube-Client-Version": "2.0",
+      "Origin": "https://www.youtube.com",
+      "Referer": `https://www.youtube.com/watch?v=${videoId}`,
     },
-    {
-      name: "WEB",
-      clientName: "WEB",
-      clientVersion: "2.20240101.00.00",
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
-      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-      xClientName: "1",
-    },
-    {
-      name: "TV_EMBEDDED",
-      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-      clientVersion: "2.0",
-      userAgent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
-      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
-      xClientName: "85",
-    },
-  ];
+    body: JSON.stringify({
+      videoId,
+      context: {
+        client: {
+          clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+          clientVersion: "2.0",
+          hl: "en",
+          gl: "US",
+        },
+        thirdParty: {
+          embedUrl: "https://www.youtube.com/",
+        },
+      },
+    }),
+  });
 
-  let lastError = "";
+  console.log("[transcribe] innertube status:", res.status);
+  if (!res.ok) throw new Error(`InnerTube returned HTTP ${res.status}`);
 
-  for (const client of clients) {
-    try {
-      console.log("[transcribe] trying client:", client.name);
-      const player = await callInnertube(videoId, client);
-      const playability = player?.playabilityStatus?.status;
-      console.log("[transcribe] playability:", playability);
+  const player = await res.json();
+  const playability = player?.playabilityStatus?.status;
+  console.log("[transcribe] playability:", playability);
 
-      if (playability === "LOGIN_REQUIRED") throw new Error("Video is age-restricted or private.");
-      if (playability === "ERROR") throw new Error("Video not found or unavailable.");
-
-      const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-      if (!tracks?.length) {
-        lastError = "No captions found. Make sure CC is available on YouTube for this video.";
-        continue;
-      }
-
-      const track =
-        tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
-        tracks.find((t) => t.languageCode === "en") ||
-        tracks.find((t) => t.languageCode?.startsWith("en")) ||
-        tracks[0];
-
-      console.log("[transcribe] track:", track.languageCode, track.kind ?? "manual");
-
-      const capRes = await fetch(track.baseUrl, {
-        headers: { "User-Agent": client.userAgent },
-      });
-
-      if (!capRes.ok) throw new Error(`Caption fetch returned HTTP ${capRes.status}`);
-      const xml = await capRes.text();
-      if (!xml?.includes("<text")) throw new Error("Caption XML was empty");
-
-      return parseXml(xml);
-    } catch (err) {
-      console.log("[transcribe] client", client.name, "failed:", err.message);
-      lastError = err.message;
-    }
+  if (playability === "LOGIN_REQUIRED") {
+    throw new Error("Video is private or age-restricted and cannot be accessed.");
+  }
+  if (playability === "ERROR" || playability === "UNPLAYABLE") {
+    throw new Error("Video is unavailable.");
   }
 
-  throw new Error(lastError || "Could not retrieve transcript after trying all methods.");
-}
+  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  console.log("[transcribe] caption tracks found:", tracks?.length ?? 0);
 
-async function callInnertube(videoId, client) {
-  const body = {
-    videoId,
-    context: {
-      client: {
-        clientName: client.clientName,
-        clientVersion: client.clientVersion,
-        hl: "en",
-        gl: "US",
-        ...(client.androidSdkVersion && { androidSdkVersion: client.androidSdkVersion }),
-      },
+  if (!tracks?.length) {
+    throw new Error("No captions found. Make sure CC is available on YouTube for this video.");
+  }
+
+  // Prefer manual English, then auto-generated English, then first available
+  const track =
+    tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
+    tracks.find((t) => t.languageCode === "en") ||
+    tracks.find((t) => t.languageCode?.startsWith("en")) ||
+    tracks[0];
+
+  console.log("[transcribe] using track:", track.languageCode, track.kind ?? "manual");
+
+  const capRes = await fetch(track.baseUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     },
-  };
+  });
 
-  const res = await fetch(
-    `https://www.youtube.com/youtubei/v1/player?key=${client.apiKey}&prettyPrint=false`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "User-Agent": client.userAgent,
-        "X-YouTube-Client-Name": client.xClientName,
-        "X-YouTube-Client-Version": client.clientVersion,
-        "Origin": "https://www.youtube.com",
-      },
-      body: JSON.stringify(body),
-    }
-  );
+  if (!capRes.ok) throw new Error(`Caption fetch returned HTTP ${capRes.status}`);
+  const xml = await capRes.text();
+  if (!xml?.includes("<text")) throw new Error("Caption XML was empty");
 
-  if (!res.ok) throw new Error(`InnerTube HTTP ${res.status} with client ${client.name}`);
-  return res.json();
+  return parseXml(xml);
 }
 
 function parseXml(xml) {

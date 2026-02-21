@@ -18,105 +18,105 @@ export default async function handler(req, res) {
   }
 }
 
-// iOS YouTube app UA — YouTube doesn't challenge mobile app requests
-const IOS_UA = "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)";
-
-const HEADERS = {
-  "User-Agent": IOS_UA,
-  "Accept-Language": "en-US,en;q=0.9",
-  "Accept": "*/*",
-  // Bypass consent + cookie walls
-  "Cookie": "SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+119; GPS=1;",
-};
-
-async function ytFetch(url) {
-  // follow redirects automatically (fetch does this by default)
-  const res = await fetch(url, { headers: HEADERS, redirect: "follow" });
-  if (!res.ok) throw new Error(`YouTube returned HTTP ${res.status} for ${url}`);
-  return res.text();
-}
-
 async function getTranscript(videoId) {
-  // ── Step 1: Try the timedtext API directly (no page scrape needed) ──
-  const directVariants = [
-    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=srv1`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en&fmt=srv1`,
-    `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en`,
-  ];
-
-  for (const url of directVariants) {
-    try {
-      const xml = await ytFetch(url);
-      if (xml?.includes("<text")) {
-        const text = parseXml(xml);
-        if (text.length > 20) {
-          console.log("[transcribe] direct timedtext success:", url);
-          return text;
-        }
-      }
-    } catch (e) {
-      console.log("[transcribe] direct attempt failed:", e.message);
+  // ── Step 1: Use InnerTube API to get video metadata + caption URLs ──
+  // This is what the YouTube iOS app uses internally - no HTML scraping
+  const innertubeRes = await fetch(
+    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+        "X-YouTube-Client-Name": "5",
+        "X-YouTube-Client-Version": "19.29.1",
+        "Origin": "https://www.youtube.com",
+        "Referer": "https://www.youtube.com/",
+      },
+      body: JSON.stringify({
+        videoId,
+        context: {
+          client: {
+            clientName: "IOS",
+            clientVersion: "19.29.1",
+            deviceModel: "iPhone16,2",
+            userAgent: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;) gzip",
+            hl: "en",
+            gl: "US",
+            timeZone: "America/New_York",
+            utcOffsetMinutes: -240,
+          },
+        },
+      }),
     }
-  }
-
-  // ── Step 2: Scrape page for caption track URL ──
-  console.log("[transcribe] falling back to page scrape");
-  const html = await ytFetch(
-    `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1&hl=en`
   );
 
-  // Pull ytInitialPlayerResponse
-  const marker = "ytInitialPlayerResponse = ";
-  const si = html.indexOf(marker);
-  if (si === -1) throw new Error("Could not find player data in page");
-
-  const js = html.slice(si + marker.length);
-  let depth = 0, end = 0;
-  for (let i = 0; i < js.length; i++) {
-    if (js[i] === "{") depth++;
-    else if (js[i] === "}") {
-      depth--;
-      if (depth === 0) { end = i + 1; break; }
-    }
+  if (!innertubeRes.ok) {
+    throw new Error(`InnerTube API returned HTTP ${innertubeRes.status}`);
   }
 
-  let player;
-  try { player = JSON.parse(js.slice(0, end)); }
-  catch { throw new Error("Failed to parse player data"); }
+  const player = await innertubeRes.json();
+  console.log("[transcribe] playability:", player?.playabilityStatus?.status);
 
   const playability = player?.playabilityStatus?.status;
   if (playability === "LOGIN_REQUIRED") throw new Error("Video is age-restricted or private.");
   if (playability === "ERROR") throw new Error("Video not found or unavailable.");
+  if (playability === "UNPLAYABLE") throw new Error("Video is unavailable in this region.");
 
+  // ── Step 2: Get caption tracks ──
   const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks?.length) throw new Error("No captions found on this video. Check that CC is available on YouTube.");
 
+  if (!tracks?.length) {
+    throw new Error("No captions found. Make sure the video has CC available on YouTube.");
+  }
+
+  // Prefer manual English captions, fall back to auto-generated, then any language
   const track =
     tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
     tracks.find((t) => t.languageCode === "en") ||
     tracks.find((t) => t.languageCode?.startsWith("en")) ||
     tracks[0];
 
-  console.log("[transcribe] track:", track.languageCode, track.kind ?? "manual");
+  console.log("[transcribe] using track:", track.languageCode, track.kind ?? "manual", track.name?.simpleText);
 
-  const xml = await ytFetch(track.baseUrl + "&fmt=srv1");
-  if (!xml?.includes("<text")) throw new Error("Caption XML was empty");
+  // ── Step 3: Fetch caption XML ──
+  const capUrl = track.baseUrl;
+  const capRes = await fetch(capUrl, {
+    headers: {
+      "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
+      "Accept-Language": "en-US,en;q=0.9",
+    },
+  });
 
+  if (!capRes.ok) throw new Error(`Caption fetch returned HTTP ${capRes.status}`);
+  const xml = await capRes.text();
+
+  if (!xml?.includes("<text")) throw new Error("Caption data was empty");
+
+  // ── Step 4: Parse XML to plain text ──
   return parseXml(xml);
 }
 
 function parseXml(xml) {
   const re = /<text[^>]*>([\s\S]*?)<\/text>/g;
+  const skip = new Set(["[Music]", "[Applause]", "[Laughter]", "♪", "[music]"]);
   const segs = [];
   let m;
-  const skip = new Set(["[Music]", "[Applause]", "[Laughter]", "♪", "[music]"]);
+
   while ((m = re.exec(xml)) !== null) {
     const t = m[1]
-      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
-      .replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\n/g, " ").trim();
+      .replace(/&amp;/g, "&")
+      .replace(/&lt;/g, "<")
+      .replace(/&gt;/g, ">")
+      .replace(/&#39;/g, "'")
+      .replace(/&quot;/g, '"')
+      .replace(/\n/g, " ")
+      .trim();
     if (t && !skip.has(t)) segs.push(t);
   }
+
   if (!segs.length) throw new Error("No text found in captions");
+
+  // Deduplicate consecutive identical lines (common in auto-captions)
   return segs.filter((s, i) => s !== segs[i - 1]).join(" ");
 }

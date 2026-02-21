@@ -19,82 +19,110 @@ export default async function handler(req, res) {
 }
 
 async function getTranscript(videoId) {
-  // ── Step 1: Use InnerTube API to get video metadata + caption URLs ──
-  // This is what the YouTube iOS app uses internally - no HTML scraping
-  const innertubeRes = await fetch(
-    "https://www.youtube.com/youtubei/v1/player?prettyPrint=false",
+  // Try multiple InnerTube client contexts — different clients have different access
+  const clients = [
+    {
+      name: "ANDROID",
+      clientName: "ANDROID",
+      clientVersion: "18.11.34",
+      androidSdkVersion: 30,
+      userAgent: "com.google.android.youtube/18.11.34 (Linux; U; Android 11) gzip",
+      apiKey: "AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w",
+      xClientName: "3",
+    },
+    {
+      name: "WEB",
+      clientName: "WEB",
+      clientVersion: "2.20240101.00.00",
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      xClientName: "1",
+    },
+    {
+      name: "TV_EMBEDDED",
+      clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+      clientVersion: "2.0",
+      userAgent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 6.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/6.0 TV Safari/538.1",
+      apiKey: "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8",
+      xClientName: "85",
+    },
+  ];
+
+  let lastError = "";
+
+  for (const client of clients) {
+    try {
+      console.log("[transcribe] trying client:", client.name);
+      const player = await callInnertube(videoId, client);
+      const playability = player?.playabilityStatus?.status;
+      console.log("[transcribe] playability:", playability);
+
+      if (playability === "LOGIN_REQUIRED") throw new Error("Video is age-restricted or private.");
+      if (playability === "ERROR") throw new Error("Video not found or unavailable.");
+
+      const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+      if (!tracks?.length) {
+        lastError = "No captions found. Make sure CC is available on YouTube for this video.";
+        continue;
+      }
+
+      const track =
+        tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
+        tracks.find((t) => t.languageCode === "en") ||
+        tracks.find((t) => t.languageCode?.startsWith("en")) ||
+        tracks[0];
+
+      console.log("[transcribe] track:", track.languageCode, track.kind ?? "manual");
+
+      const capRes = await fetch(track.baseUrl, {
+        headers: { "User-Agent": client.userAgent },
+      });
+
+      if (!capRes.ok) throw new Error(`Caption fetch returned HTTP ${capRes.status}`);
+      const xml = await capRes.text();
+      if (!xml?.includes("<text")) throw new Error("Caption XML was empty");
+
+      return parseXml(xml);
+    } catch (err) {
+      console.log("[transcribe] client", client.name, "failed:", err.message);
+      lastError = err.message;
+    }
+  }
+
+  throw new Error(lastError || "Could not retrieve transcript after trying all methods.");
+}
+
+async function callInnertube(videoId, client) {
+  const body = {
+    videoId,
+    context: {
+      client: {
+        clientName: client.clientName,
+        clientVersion: client.clientVersion,
+        hl: "en",
+        gl: "US",
+        ...(client.androidSdkVersion && { androidSdkVersion: client.androidSdkVersion }),
+      },
+    },
+  };
+
+  const res = await fetch(
+    `https://www.youtube.com/youtubei/v1/player?key=${client.apiKey}&prettyPrint=false`,
     {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-        "X-YouTube-Client-Name": "5",
-        "X-YouTube-Client-Version": "19.29.1",
+        "User-Agent": client.userAgent,
+        "X-YouTube-Client-Name": client.xClientName,
+        "X-YouTube-Client-Version": client.clientVersion,
         "Origin": "https://www.youtube.com",
-        "Referer": "https://www.youtube.com/",
       },
-      body: JSON.stringify({
-        videoId,
-        context: {
-          client: {
-            clientName: "IOS",
-            clientVersion: "19.29.1",
-            deviceModel: "iPhone16,2",
-            userAgent: "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;) gzip",
-            hl: "en",
-            gl: "US",
-            timeZone: "America/New_York",
-            utcOffsetMinutes: -240,
-          },
-        },
-      }),
+      body: JSON.stringify(body),
     }
   );
 
-  if (!innertubeRes.ok) {
-    throw new Error(`InnerTube API returned HTTP ${innertubeRes.status}`);
-  }
-
-  const player = await innertubeRes.json();
-  console.log("[transcribe] playability:", player?.playabilityStatus?.status);
-
-  const playability = player?.playabilityStatus?.status;
-  if (playability === "LOGIN_REQUIRED") throw new Error("Video is age-restricted or private.");
-  if (playability === "ERROR") throw new Error("Video not found or unavailable.");
-  if (playability === "UNPLAYABLE") throw new Error("Video is unavailable in this region.");
-
-  // ── Step 2: Get caption tracks ──
-  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-
-  if (!tracks?.length) {
-    throw new Error("No captions found. Make sure the video has CC available on YouTube.");
-  }
-
-  // Prefer manual English captions, fall back to auto-generated, then any language
-  const track =
-    tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
-    tracks.find((t) => t.languageCode === "en") ||
-    tracks.find((t) => t.languageCode?.startsWith("en")) ||
-    tracks[0];
-
-  console.log("[transcribe] using track:", track.languageCode, track.kind ?? "manual", track.name?.simpleText);
-
-  // ── Step 3: Fetch caption XML ──
-  const capUrl = track.baseUrl;
-  const capRes = await fetch(capUrl, {
-    headers: {
-      "User-Agent": "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-      "Accept-Language": "en-US,en;q=0.9",
-    },
-  });
-
-  if (!capRes.ok) throw new Error(`Caption fetch returned HTTP ${capRes.status}`);
-  const xml = await capRes.text();
-
-  if (!xml?.includes("<text")) throw new Error("Caption data was empty");
-
-  // ── Step 4: Parse XML to plain text ──
-  return parseXml(xml);
+  if (!res.ok) throw new Error(`InnerTube HTTP ${res.status} with client ${client.name}`);
+  return res.json();
 }
 
 function parseXml(xml) {
@@ -102,21 +130,12 @@ function parseXml(xml) {
   const skip = new Set(["[Music]", "[Applause]", "[Laughter]", "♪", "[music]"]);
   const segs = [];
   let m;
-
   while ((m = re.exec(xml)) !== null) {
     const t = m[1]
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/\n/g, " ")
-      .trim();
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\n/g, " ").trim();
     if (t && !skip.has(t)) segs.push(t);
   }
-
   if (!segs.length) throw new Error("No text found in captions");
-
-  // Deduplicate consecutive identical lines (common in auto-captions)
   return segs.filter((s, i) => s !== segs[i - 1]).join(" ");
 }

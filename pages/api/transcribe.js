@@ -1,5 +1,3 @@
-import https from "https";
-
 export default async function handler(req, res) {
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
@@ -20,127 +18,105 @@ export default async function handler(req, res) {
   }
 }
 
-// Promisified https.get
-function httpsGet(url, headers = {}) {
-  return new Promise((resolve, reject) => {
-    const opts = {
-      headers: {
-        "User-Agent":
-          "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-        "Accept-Language": "en-US,en;q=0.9",
-        ...headers,
-      },
-    };
-    https
-      .get(url, opts, (r) => {
-        const chunks = [];
-        r.on("data", (c) => chunks.push(c));
-        r.on("end", () =>
-          resolve({
-            status: r.statusCode,
-            body: Buffer.concat(chunks).toString(),
-          }),
-        );
-        r.on("error", reject);
-      })
-      .on("error", reject);
-  });
+// iOS YouTube app UA — YouTube doesn't challenge mobile app requests
+const IOS_UA = "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)";
+
+const HEADERS = {
+  "User-Agent": IOS_UA,
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept": "*/*",
+  // Bypass consent + cookie walls
+  "Cookie": "SOCS=CAI; CONSENT=YES+cb.20210328-17-p0.en+FX+119; GPS=1;",
+};
+
+async function ytFetch(url) {
+  // follow redirects automatically (fetch does this by default)
+  const res = await fetch(url, { headers: HEADERS, redirect: "follow" });
+  if (!res.ok) throw new Error(`YouTube returned HTTP ${res.status} for ${url}`);
+  return res.text();
 }
 
 async function getTranscript(videoId) {
-  // Use the iOS YouTube client — much harder for YouTube to block than browser UA
-  // Fetch video page
-  const { status, body: html } = await httpsGet(
-    `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1`,
-    { Cookie: "SOCS=CAI; GPS=1" },
+  // ── Step 1: Try the timedtext API directly (no page scrape needed) ──
+  const directVariants = [
+    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=srv1`,
+    `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en`,
+    `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en&fmt=srv1`,
+    `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en`,
+  ];
+
+  for (const url of directVariants) {
+    try {
+      const xml = await ytFetch(url);
+      if (xml?.includes("<text")) {
+        const text = parseXml(xml);
+        if (text.length > 20) {
+          console.log("[transcribe] direct timedtext success:", url);
+          return text;
+        }
+      }
+    } catch (e) {
+      console.log("[transcribe] direct attempt failed:", e.message);
+    }
+  }
+
+  // ── Step 2: Scrape page for caption track URL ──
+  console.log("[transcribe] falling back to page scrape");
+  const html = await ytFetch(
+    `https://www.youtube.com/watch?v=${videoId}&bpctr=9999999999&has_verified=1&hl=en`
   );
 
-  if (status !== 200) throw new Error(`YouTube returned HTTP ${status}`);
-
-  // Extract ytInitialPlayerResponse
+  // Pull ytInitialPlayerResponse
   const marker = "ytInitialPlayerResponse = ";
   const si = html.indexOf(marker);
-  if (si === -1) throw new Error("Could not find player response in page");
+  if (si === -1) throw new Error("Could not find player data in page");
 
   const js = html.slice(si + marker.length);
-  let depth = 0,
-    end = 0;
+  let depth = 0, end = 0;
   for (let i = 0; i < js.length; i++) {
     if (js[i] === "{") depth++;
     else if (js[i] === "}") {
       depth--;
-      if (depth === 0) {
-        end = i + 1;
-        break;
-      }
+      if (depth === 0) { end = i + 1; break; }
     }
   }
 
   let player;
-  try {
-    player = JSON.parse(js.slice(0, end));
-  } catch {
-    throw new Error("Failed to parse player response");
-  }
+  try { player = JSON.parse(js.slice(0, end)); }
+  catch { throw new Error("Failed to parse player data"); }
 
-  // Get caption tracks
-  const tracks =
-    player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  if (!tracks?.length) {
-    // Try to give a useful reason
-    const status = player?.playabilityStatus;
-    if (status?.status === "LOGIN_REQUIRED")
-      throw new Error("This video is age-restricted or private.");
-    if (status?.status === "ERROR")
-      throw new Error("Video not found or unavailable.");
-    throw new Error(
-      "No captions found. Make sure the video has CC enabled on YouTube.",
-    );
-  }
+  const playability = player?.playabilityStatus?.status;
+  if (playability === "LOGIN_REQUIRED") throw new Error("Video is age-restricted or private.");
+  if (playability === "ERROR") throw new Error("Video not found or unavailable.");
 
-  // Pick English track
+  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
+  if (!tracks?.length) throw new Error("No captions found on this video. Check that CC is available on YouTube.");
+
   const track =
     tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
     tracks.find((t) => t.languageCode === "en") ||
     tracks.find((t) => t.languageCode?.startsWith("en")) ||
     tracks[0];
 
-  console.log(
-    "[transcribe] track:",
-    track.languageCode,
-    track.kind ?? "manual",
-    track.name?.simpleText,
-  );
+  console.log("[transcribe] track:", track.languageCode, track.kind ?? "manual");
 
-  // Fetch caption XML
-  const capUrl = track.baseUrl + "&fmt=srv1";
-  const { status: capStatus, body: xml } = await httpsGet(capUrl);
-  if (capStatus !== 200)
-    throw new Error(`Caption fetch returned HTTP ${capStatus}`);
-  if (!xml.includes("<text")) throw new Error("Caption XML was empty");
+  const xml = await ytFetch(track.baseUrl + "&fmt=srv1");
+  if (!xml?.includes("<text")) throw new Error("Caption XML was empty");
 
-  // Parse XML
+  return parseXml(xml);
+}
+
+function parseXml(xml) {
   const re = /<text[^>]*>([\s\S]*?)<\/text>/g;
   const segs = [];
   let m;
+  const skip = new Set(["[Music]", "[Applause]", "[Laughter]", "♪", "[music]"]);
   while ((m = re.exec(xml)) !== null) {
     const t = m[1]
-      .replace(/&amp;/g, "&")
-      .replace(/&lt;/g, "<")
-      .replace(/&gt;/g, ">")
-      .replace(/&#39;/g, "'")
-      .replace(/&quot;/g, '"')
-      .replace(/\n/g, " ")
-      .trim();
-    if (
-      t &&
-      !["[Music]", "[Applause]", "[Laughter]", "♪", "[music]"].includes(t)
-    ) {
-      segs.push(t);
-    }
+      .replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+      .replace(/&#39;/g, "'").replace(/&quot;/g, '"').replace(/\n/g, " ").trim();
+    if (t && !skip.has(t)) segs.push(t);
   }
-
-  if (!segs.length) throw new Error("Transcript was empty after parsing");
-
+  if (!segs.length) throw new Error("No text found in captions");
   return segs.filter((s, i) => s !== segs[i - 1]).join(" ");
 }

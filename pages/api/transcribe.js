@@ -13,80 +13,98 @@ export default async function handler(req, res) {
     const wordCount = transcript.trim().split(/\s+/).filter(Boolean).length;
     return res.status(200).json({ transcript, wordCount });
   } catch (err) {
-    console.error("[transcribe]", err.message);
+    console.error("[transcribe] FINAL ERROR:", err.message);
     return res.status(500).json({ error: err.message });
   }
 }
 
+const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36";
+
+async function ytFetch(url) {
+  const res = await fetch(url, {
+    headers: {
+      "User-Agent": UA,
+      "Accept-Language": "en-US,en;q=0.9",
+      "Accept": "*/*",
+      "Cookie": "SOCS=CAI; CONSENT=YES+cb;",
+    },
+    redirect: "follow",
+  });
+  console.log("[transcribe] fetch", url.slice(0, 80), "→", res.status);
+  if (!res.ok) throw new Error(`HTTP ${res.status} from ${url.slice(0, 60)}`);
+  return res.text();
+}
+
 async function getTranscript(videoId) {
-  // TVHTML5_SIMPLY_EMBEDDED_PLAYER with thirdParty.embedUrl bypasses
-  // LOGIN_REQUIRED on public videos — embedded players skip auth checks
-  const res = await fetch("https://www.youtube.com/youtubei/v1/player?prettyPrint=false", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      "X-YouTube-Client-Name": "85",
-      "X-YouTube-Client-Version": "2.0",
-      "Origin": "https://www.youtube.com",
-      "Referer": `https://www.youtube.com/watch?v=${videoId}`,
-    },
-    body: JSON.stringify({
-      videoId,
-      context: {
-        client: {
-          clientName: "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-          clientVersion: "2.0",
-          hl: "en",
-          gl: "US",
-        },
-        thirdParty: {
-          embedUrl: "https://www.youtube.com/",
-        },
-      },
-    }),
-  });
+  // Step 1: Get the list of available caption tracks from timedtext list API
+  const listXml = await ytFetch(
+    `https://www.youtube.com/api/timedtext?v=${videoId}&type=list`
+  );
 
-  console.log("[transcribe] innertube status:", res.status);
-  if (!res.ok) throw new Error(`InnerTube returned HTTP ${res.status}`);
+  console.log("[transcribe] track list length:", listXml.length);
+  console.log("[transcribe] track list preview:", listXml.slice(0, 300));
 
-  const player = await res.json();
-  const playability = player?.playabilityStatus?.status;
-  console.log("[transcribe] playability:", playability);
+  // Parse available tracks from the list XML
+  // Format: <track id="0" name="" lang_code="en" lang_default="true" kind="asr" .../>
+  const trackMatches = [...listXml.matchAll(/<track\s+([^/]+)\/?>/g)];
+  console.log("[transcribe] tracks found in list:", trackMatches.length);
 
-  if (playability === "LOGIN_REQUIRED") {
-    throw new Error("Video is private or age-restricted and cannot be accessed.");
-  }
-  if (playability === "ERROR" || playability === "UNPLAYABLE") {
-    throw new Error("Video is unavailable.");
-  }
+  let trackUrl = null;
 
-  const tracks = player?.captions?.playerCaptionsTracklistRenderer?.captionTracks;
-  console.log("[transcribe] caption tracks found:", tracks?.length ?? 0);
+  if (trackMatches.length > 0) {
+    // Find English track
+    const getAttr = (str, attr) => str.match(new RegExp(`${attr}="([^"]+)"`))?.[1];
 
-  if (!tracks?.length) {
-    throw new Error("No captions found. Make sure CC is available on YouTube for this video.");
+    const tracks = trackMatches.map(m => ({
+      raw: m[1],
+      lang: getAttr(m[1], "lang_code"),
+      name: getAttr(m[1], "name") || "",
+      kind: getAttr(m[1], "kind") || "manual",
+      id: getAttr(m[1], "id") || "0",
+    }));
+
+    console.log("[transcribe] parsed tracks:", JSON.stringify(tracks.map(t => ({ lang: t.lang, kind: t.kind }))));
+
+    const track =
+      tracks.find(t => t.lang === "en" && t.kind !== "asr") ||
+      tracks.find(t => t.lang === "en") ||
+      tracks.find(t => t.lang?.startsWith("en")) ||
+      tracks[0];
+
+    if (track) {
+      const name = encodeURIComponent(track.name);
+      const kind = track.kind !== "manual" ? `&kind=${track.kind}` : "";
+      trackUrl = `https://www.youtube.com/api/timedtext?v=${videoId}&lang=${track.lang}&name=${name}${kind}&fmt=srv1`;
+    }
   }
 
-  // Prefer manual English, then auto-generated English, then first available
-  const track =
-    tracks.find((t) => t.languageCode === "en" && t.kind !== "asr") ||
-    tracks.find((t) => t.languageCode === "en") ||
-    tracks.find((t) => t.languageCode?.startsWith("en")) ||
-    tracks[0];
+  // Step 2: Fallback — try common timedtext URLs directly if list was empty
+  if (!trackUrl) {
+    console.log("[transcribe] track list empty, trying direct URLs");
+    const directUrls = [
+      `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en&fmt=srv1`,
+      `https://www.youtube.com/api/timedtext?v=${videoId}&lang=en`,
+      `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en&fmt=srv1`,
+      `https://www.youtube.com/api/timedtext?v=${videoId}&kind=asr&lang=en`,
+    ];
 
-  console.log("[transcribe] using track:", track.languageCode, track.kind ?? "manual");
+    for (const url of directUrls) {
+      try {
+        const xml = await ytFetch(url);
+        if (xml?.includes("<text")) {
+          console.log("[transcribe] direct URL worked:", url);
+          return parseXml(xml);
+        }
+      } catch (e) {
+        console.log("[transcribe] direct URL failed:", e.message);
+      }
+    }
+    throw new Error("No captions found. Make sure this video has CC enabled on YouTube.");
+  }
 
-  const capRes = await fetch(track.baseUrl, {
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    },
-  });
-
-  if (!capRes.ok) throw new Error(`Caption fetch returned HTTP ${capRes.status}`);
-  const xml = await capRes.text();
-  if (!xml?.includes("<text")) throw new Error("Caption XML was empty");
-
+  // Step 3: Fetch the actual caption XML
+  const xml = await ytFetch(trackUrl);
+  if (!xml?.includes("<text")) throw new Error("Caption XML returned but was empty");
   return parseXml(xml);
 }
 
